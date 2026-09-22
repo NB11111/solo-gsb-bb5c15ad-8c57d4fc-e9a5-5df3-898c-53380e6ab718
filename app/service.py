@@ -547,39 +547,89 @@ def ingest_batch(
 # reads
 # ---------------------------------------------------------------------------
 
-def list_published(
+def _published_keyset(
+    ts: str, src: str, seq: int
+) -> tuple[str, list[Any]]:
+    """Exclusive ``(observed_at, source_id, seq)`` keyset predicate + params."""
+    return (
+        " AND (observed_at > ?"
+        " OR (observed_at = ? AND source_id > ?)"
+        " OR (observed_at = ? AND source_id = ? AND seq > ?))",
+        [ts, ts, src, ts, src, seq],
+    )
+
+
+def _fetch_published_rows(
     conn: sqlite3.Connection,
     session_id: str,
-    limit: int,
+    fetch_limit: int,
+    *,
+    start_after: Optional[tuple] = None,
     cursor: Optional[str] = None,
-) -> dict[str, Any]:
+) -> list[sqlite3.Row]:
+    """Raw published rows in deterministic merge order, up to ``fetch_limit``.
+
+    The exclusive lower bound comes from a pagination ``cursor`` when given,
+    otherwise from an explicit ``start_after`` position
+    ``(observed_at, source_id, seq)`` (used when resuming from a checkpoint).
+    Must be called inside the caller's open transaction.
+    """
     where = "session_id = ? AND status = 'published'"
     params: list[Any] = [session_id]
     if cursor:
         ts, src, seq = _decode_cursor(cursor, 3)
-        # Keyset on the deterministic timeline order
-        # (observed_at, source_id, seq).
-        where += (
-            " AND (observed_at > ?"
-            " OR (observed_at = ? AND source_id > ?)"
-            " OR (observed_at = ? AND source_id = ? AND seq > ?))"
-        )
-        params += [ts, ts, src, ts, src, seq]
+        clause, clause_params = _published_keyset(ts, src, seq)
+        where += clause
+        params += clause_params
+    elif start_after is not None:
+        ts, src, seq = start_after
+        clause, clause_params = _published_keyset(ts, src, seq)
+        where += clause
+        params += clause_params
+    return conn.execute(
+        f"SELECT * FROM readings WHERE {where}"
+        " ORDER BY observed_at, source_id, seq LIMIT ?",
+        (*params, fetch_limit),
+    ).fetchall()
 
-    with read_transaction(conn):
-        session = _load_session(conn, session_id)
-        rows = conn.execute(
-            f"SELECT * FROM readings WHERE {where}"
-            " ORDER BY observed_at, source_id, seq LIMIT ?",
-            (*params, limit + 1),
-        ).fetchall()
 
+def _published_page(
+    conn: sqlite3.Connection,
+    session_id: str,
+    limit: int,
+    *,
+    start_after: Optional[tuple] = None,
+    cursor: Optional[str] = None,
+) -> tuple[list[sqlite3.Row], Optional[str]]:
+    """One keyset page of published readings plus its ``next_cursor``.
+
+    Returns ``(page, next_cursor)`` with at most ``limit`` readings; the
+    cursor is ``None`` when no further readings exist.  Must be called inside
+    the caller's open transaction.
+    """
+    rows = _fetch_published_rows(
+        conn, session_id, limit + 1, start_after=start_after, cursor=cursor
+    )
     has_more = len(rows) > limit
     page = rows[:limit]
     next_cursor = None
     if has_more and page:
         last = page[-1]
         next_cursor = _encode_cursor((last["observed_at"], last["source_id"], last["seq"]))
+    return page, next_cursor
+
+
+def list_published(
+    conn: sqlite3.Connection,
+    session_id: str,
+    limit: int,
+    cursor: Optional[str] = None,
+) -> dict[str, Any]:
+    with read_transaction(conn):
+        session = _load_session(conn, session_id)
+        page, next_cursor = _published_page(
+            conn, session_id, limit, cursor=cursor
+        )
 
     return {
         "session_id": session_id,

@@ -136,6 +136,59 @@ class CreatedSessionResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# consumer checkpoints of the published stream
+# ---------------------------------------------------------------------------
+
+class CheckpointPosition(BaseModel):
+    """Position in the deterministic published order ``(observed_at, source_id, seq)``.
+
+    ``None`` means "before the first reading" (the stream was empty when the
+    checkpoint was created).
+    """
+
+    observed_at: Optional[str] = None
+    source_id: Optional[str] = None
+    seq: Optional[int] = None
+
+
+class CreateCheckpointIn(BaseModel):
+    checkpoint_name: str = Field(
+        ..., min_length=1, description="Unique checkpoint name within the session"
+    )
+
+    @field_validator("checkpoint_name")
+    @classmethod
+    def _name_not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("checkpoint_name must not be blank")
+        return v
+
+
+class CheckpointOut(BaseModel):
+    session_id: str
+    checkpoint_name: str
+    position: Optional[CheckpointPosition] = None
+    published_watermark: Optional[str] = None
+    created_at: str
+
+
+class CheckpointsResponse(BaseModel):
+    session_id: str
+    checkpoints: list[CheckpointOut]
+
+
+class CheckpointPullResponse(BaseModel):
+    session_id: str
+    checkpoint_name: str
+    next_cursor: Optional[str] = None
+    # Watermark frozen in the checkpoint's creation snapshot.
+    checkpoint_watermark: Optional[str] = None
+    # The session's current published watermark.
+    published_watermark: Optional[str] = None
+    readings: list[ReadingOut]
+
+
+# ---------------------------------------------------------------------------
 # alert rules
 # ---------------------------------------------------------------------------
 

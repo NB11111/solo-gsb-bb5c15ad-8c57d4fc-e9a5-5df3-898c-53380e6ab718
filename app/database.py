@@ -239,9 +239,57 @@ def _migration_2(conn: sqlite3.Connection, applied_at: str) -> None:
     )
 
 
+def _migration_3(conn: sqlite3.Connection, applied_at: str) -> None:
+    """Consumer checkpoints over a session's published reading stream.
+
+    A checkpoint freezes, in one read-only snapshot, the current tail of the
+    published stream (its position in deterministic merge order
+    ``(observed_at, source_id, seq)``) together with the published watermark
+    seen in that same snapshot.  Names are unique per session; resuming from a
+    checkpoint pages through whatever has been published after that position,
+    so later publishes -- and closing the session -- never change a
+    checkpoint's meaning.
+    """
+    conn.execute(
+        """
+CREATE TABLE stream_checkpoints (
+    session_id              TEXT NOT NULL REFERENCES sessions(session_id),
+    checkpoint_name         TEXT NOT NULL,
+    -- Position in the deterministic published order (observed_at,
+    -- source_id, seq): the last published reading visible in the creation
+    -- snapshot.  All three NULL means "before the first reading".
+    position_observed_at    TEXT,
+    position_source_id      TEXT,
+    position_seq            INTEGER,
+    -- Published watermark observed in the same snapshot (may itself be NULL
+    -- before the first publish).
+    published_watermark     TEXT,
+    created_at              TEXT NOT NULL,
+    PRIMARY KEY (session_id, checkpoint_name),
+    -- The triple is either entirely NULL (empty stream) or entirely set.
+    CHECK ((position_observed_at IS NULL AND position_source_id IS NULL
+            AND position_seq IS NULL)
+           OR (position_observed_at IS NOT NULL AND position_source_id IS NOT NULL
+               AND position_seq IS NOT NULL))
+)
+"""
+    )
+    # Resume scans page after the frozen position in merge order, exactly like
+    # the ordinary published-stream listing.
+    conn.execute(
+        "CREATE INDEX idx_stream_checkpoints_session"
+        " ON stream_checkpoints (session_id, created_at)"
+    )
+    conn.execute(
+        "INSERT INTO schema_migrations (version, applied_at) VALUES (3, ?)",
+        (applied_at,),
+    )
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection, str], None]] = {
     1: _migration_1,
     2: _migration_2,
+    3: _migration_3,
 }
 LATEST_VERSION = max(MIGRATIONS)
 

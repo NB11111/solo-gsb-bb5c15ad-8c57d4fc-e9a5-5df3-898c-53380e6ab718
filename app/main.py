@@ -5,20 +5,24 @@ import sqlite3
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
-from fastapi import Depends, FastAPI, Query, Request
+from fastapi import Depends, FastAPI, Query, Request, Response
 from fastapi.responses import JSONResponse
 
-from . import alerts, correlated, service
+from . import alerts, checkpoints, correlated, service
 from .config import settings
 from .database import get_db, init_db
 from .models import (
     AlertHistoryResponse,
     AlertRuleOut,
     AlertRulesResponse,
+    CheckpointOut,
+    CheckpointPullResponse,
+    CheckpointsResponse,
     CorrelatedHistoryResponse,
     CorrelatedRuleOut,
     CorrelatedRulesResponse,
     CreateAlertRuleIn,
+    CreateCheckpointIn,
     CreateCorrelatedRuleIn,
     CreateSessionIn,
     CreatedSessionResponse,
@@ -43,7 +47,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Lab Sensor Timeline Merge API",
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "Out-of-order sensor reporting with per-session fixed source lists, "
         "a slowest-source watermark (minus allowed lateness), deterministic "
@@ -54,7 +58,10 @@ app = FastAPI(
         "drive per-source threshold alert state machines (enter / active / "
         "recovered) with hysteresis and consecutive-count debouncing, plus "
         "cross-source correlated rules that fire once when 2-4 sources breach "
-        "their own thresholds together inside a shared event-time window."
+        "their own thresholds together inside a shared event-time window. "
+        "Consumers can also freeze named checkpoints of the published stream "
+        "(tail position plus watermark from one read-only snapshot) and resume "
+        "deterministically ordered, cursor-paginated reads from them."
     ),
     lifespan=lifespan,
 )
@@ -209,6 +216,111 @@ def pull_quarantine(
 ) -> QuarantineResponse:
     """Late readings that arrived behind the already-published watermark."""
     return QuarantineResponse(**service.list_quarantined(conn, session_id, limit, cursor))
+
+
+# ---------------------------------------------------------------------------
+# consumer checkpoints of the published stream
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/sessions/{session_id}/checkpoints",
+    response_model=CheckpointOut,
+    tags=["checkpoints"],
+)
+def create_checkpoint(
+    session_id: str,
+    body: CreateCheckpointIn,
+    response: Response,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> CheckpointOut:
+    """Create a named consumer checkpoint of the published stream.
+
+    The checkpoint records, from one read-only snapshot, the current tail of
+    the deterministic published order ``(observed_at, source_id, seq)`` and
+    the published watermark visible in that same snapshot.  Names are unique
+    per session: retrying creation with the same name while the stream tail
+    has not moved is idempotent (200, stored checkpoint returned unchanged);
+    the same name after the stream has advanced is a 409 conflict.
+    """
+    result, created = checkpoints.create_checkpoint(
+        conn, session_id, body.checkpoint_name
+    )
+    # 201 for a newly stored checkpoint; 200 for an idempotent same-position
+    # retry (distinguishable from the first creation, as sealing already is).
+    response.status_code = 201 if created else 200
+    return CheckpointOut(**result)
+
+
+@app.get(
+    "/sessions/{session_id}/checkpoints",
+    response_model=CheckpointsResponse,
+    tags=["checkpoints"],
+)
+def list_checkpoints(
+    session_id: str,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> CheckpointsResponse:
+    return CheckpointsResponse(
+        session_id=session_id, checkpoints=checkpoints.list_checkpoints(conn, session_id)
+    )
+
+
+@app.get(
+    "/sessions/{session_id}/checkpoints/{checkpoint_name}",
+    response_model=CheckpointOut,
+    tags=["checkpoints"],
+)
+def get_checkpoint(
+    session_id: str,
+    checkpoint_name: str,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> CheckpointOut:
+    return CheckpointOut(
+        **checkpoints.get_checkpoint(conn, session_id, checkpoint_name)
+    )
+
+
+@app.delete(
+    "/sessions/{session_id}/checkpoints/{checkpoint_name}",
+    status_code=204,
+    tags=["checkpoints"],
+)
+def delete_checkpoint(
+    session_id: str,
+    checkpoint_name: str,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> Response:
+    """Delete one checkpoint; an unknown name (or session) returns 404."""
+    checkpoints.delete_checkpoint(conn, session_id, checkpoint_name)
+    return Response(status_code=204)
+
+
+@app.get(
+    "/sessions/{session_id}/checkpoints/{checkpoint_name}/stream",
+    response_model=CheckpointPullResponse,
+    tags=["checkpoints"],
+)
+def pull_from_checkpoint(
+    session_id: str,
+    checkpoint_name: str,
+    limit: int = Query(100, ge=1, le=1000),
+    cursor: Optional[str] = Query(None, description="Opaque next_cursor from a previous page"),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> CheckpointPullResponse:
+    """Resume the published stream strictly after a frozen checkpoint.
+
+    Uses the same deterministic order ``(observed_at, source_id, seq)`` and
+    keyset cursor pagination as ``/stream``.  The first page starts just after
+    the checkpoint's frozen position (or from the very first reading when the
+    stream was empty at creation time); later pages pass ``next_cursor``.
+    Because the bookmark is immutable, readings published afterwards -- or the
+    session closing -- do not change what the checkpoint means.
+    """
+    return CheckpointPullResponse(
+        **checkpoints.list_from_checkpoint(
+            conn, session_id, checkpoint_name, limit, cursor
+        )
+    )
 
 
 # ---------------------------------------------------------------------------

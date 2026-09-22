@@ -19,6 +19,12 @@ buffered 读数按既定全局顺序一次性发布（**尾流发布**）、推�
    可选 `value_key` 与 `window_seconds`）。系统按归并顺序为每个条件维护“最近一次命中”，
    当所有条件的命中都落在各自的事件时间窗口内时产生**一次** `correlated_entered` 事件；
    任一条件超窗即静默回到等待状态，可再次触发。
+3. **消费者检查点（checkpoint）**：消费者可以在会话内为已发布流创建**命名检查点**。
+   创建时在**同一只读快照**里同时记录当时已发布流的尾部位置（确定顺序
+   `(observed_at, source_id, seq)`）与已发布水位线；名称在会话内唯一。
+   同名同位置重复创建是**幂等**的（返回既有检查点），同名但流位置已移动返回 **409**。
+   从检查点继续读取沿用同一确定顺序与不透明游标分页，**后续发布乃至会话关闭都不会改变
+   检查点的含义**——它永远是一个不可变的书签。
 
 - 语言/框架：Python 3.11 · FastAPI · Uvicorn
 - 存储：SQLite（WAL 模式，单文件，零外部依赖）
@@ -57,7 +63,7 @@ docker compose up --build
 ```bash
 python3 -m pip install -r requirements.txt
 SENSOR_DB_PATH=./sensors.db uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行 109 个端到端行为测试（需 pytest、httpx）
+pytest -q        # 运行 138 个端到端行为测试（需 pytest、httpx）
 ```
 
 ## 时间线语义
@@ -242,7 +248,63 @@ curl -s 'localhost:8000/sessions/lab-1/stream?limit=50'
 curl -s 'localhost:8000/sessions/lab-1/quarantine'
 ```
 
-### 6. 会话状态（辅助接口）
+### 6. 已发布流的消费者检查点
+
+检查点把消费者在已发布流中的位置固化成会话内**唯一命名**的书签。创建时在**同一只读
+快照**中同时读取：已发布流的尾部位置（确定顺序 `(observed_at, source_id, seq)` 的最后
+一条；流为空时 `position` 为 `null`）与该快照中会话的 `published_watermark`。
+检查点一经写入即不可变：之后的发布（包括尾流发布）和会话关闭都不会移动它。
+
+**创建检查点** `POST /sessions/{session_id}/checkpoints`
+
+```bash
+curl -s -X POST localhost:8000/sessions/lab-1/checkpoints \
+  -H 'Content-Type: application/json' -d '{"checkpoint_name": "after-batch-1"}'
+```
+
+- 首次创建返回 **201**；同名在流位置未变化时重复创建是**幂等重试**，返回 **200** 与
+  完全相同的既有检查点（`created_at` 不变）；同名但流尾部已移动 → **409**，既有检查点
+  原样保留。流为空时创建的检查点（`position: null`）在有读数发布后再同名创建也会 409。
+- 名称为非空字符串（空白 → 422，缺字段 → 422）；会话不存在 → 404。同名检查点在**不同
+  会话**之间互不影响。
+
+```json
+{
+  "session_id": "lab-1",
+  "checkpoint_name": "after-batch-1",
+  "position": {
+    "observed_at": "2026-01-01T10:00:05Z",
+    "source_id": "thermometer-a",
+    "seq": 1
+  },
+  "published_watermark": "2026-01-01T10:00:10Z",
+  "created_at": "2026-01-01T12:00:00Z"
+}
+```
+
+**列出 / 查看 / 删除**
+
+- `GET /sessions/{session_id}/checkpoints`：列出会话全部检查点，按创建顺序排列。
+- `GET /sessions/{session_id}/checkpoints/{checkpoint_name}`：查看单个检查点；不存在 → 404。
+- `DELETE /sessions/{session_id}/checkpoints/{checkpoint_name}`：删除一个检查点，返回
+  **204**；名称或会话不存在 → 404。删除后该名称可再次用于创建。
+
+**按检查点继续读取** `GET /sessions/{session_id}/checkpoints/{checkpoint_name}/stream?limit=100&cursor=...`
+
+- 首页返回**严格位于**检查点冻结位置**之后**的已发布读数，顺序与游标规则与普通
+  `/stream` 完全一致（`(observed_at, source_id, seq)`，keyset 分页，`next_cursor` 为
+  `null` 表示取完，损坏游标 → 400）；翻页时原样回传 `next_cursor`。
+- 在流为空（`position: null`）时创建的检查点从**第一条**已发布读数开始返回。
+- 检查点不会被更新：检查点之后才发布的读数（含封存后的尾流发布）会出现在继续读取的
+  结果中，但冻结位置与冻结水位线保持不变；重复继续读取永远得到同一个后缀。
+- 响应同时给出 `checkpoint_watermark`（创建快照中冻结的水位线）与 `published_watermark`
+  （会话当前水位线）；检查点或会话不存在 → 404。
+
+```bash
+curl -s 'localhost:8000/sessions/lab-1/checkpoints/after-batch-1/stream?limit=50'
+```
+
+### 7. 会话状态（辅助接口）
 
 `GET /sessions/{session_id}`：返回来源列表、迟到容忍、是否已全部首报、
 已发布水位线与当前计算出的有效水位线，以及封存/关闭状态：
@@ -273,7 +335,7 @@ curl -s 'localhost:8000/sessions/lab-1/quarantine'
 }
 ```
 
-### 7. 创建告警规则
+### 8. 创建告警规则
 
 `POST /sessions/{session_id}/alert-rules`
 
@@ -306,12 +368,12 @@ curl -s -X POST localhost:8000/sessions/lab-1/alert-rules \
 响应 201，含规则当前的 `state`（`normal`/`active`）与 `streak`。若该来源此前已有已发布读数，
 创建时立即回放并可能直接返回 `active` 且生成历史事件。
 
-### 8. 查询规则
+### 9. 查询规则
 
 - `GET /sessions/{session_id}/alert-rules`：列出会话全部规则（含当前状态）。
 - `GET /sessions/{session_id}/alert-rules/{rule_id}`：单条规则；不存在 → 404。
 
-### 9. 查询当前告警
+### 10. 查询当前告警
 
 `GET /sessions/{session_id}/alerts/current?source_id=...`
 
@@ -323,7 +385,7 @@ curl -s -X POST localhost:8000/sessions/lab-1/alert-rules \
 curl -s 'localhost:8000/sessions/lab-1/alerts/current'
 ```
 
-### 10. 查询告警历史（分页）
+### 11. 查询告警历史（分页）
 
 `GET /sessions/{session_id}/alerts/history?limit=100&cursor=...&source_id=...&rule_id=...&event_type=...`
 
@@ -336,7 +398,7 @@ curl -s 'localhost:8000/sessions/lab-1/alerts/current'
 curl -s 'localhost:8000/sessions/lab-1/alerts/history?limit=20&event_type=entered'
 ```
 
-### 11. 创建跨来源复合告警规则
+### 12. 创建跨来源复合告警规则
 
 `POST /sessions/{session_id}/correlated-rules`
 
@@ -367,12 +429,12 @@ curl -s -X POST localhost:8000/sessions/lab-1/correlated-rules \
 `last_seq`）。创建时立即回放，已有的已发布读数可能直接让规则返回 `correlated`。
 结构错误（条件数不在 2～4、来源重复、窗口非正、NaN 阈值等）→ 422；重复 `rule_id` → 409。
 
-### 12. 查询复合规则
+### 13. 查询复合规则
 
 - `GET /sessions/{session_id}/correlated-rules`：列出会话全部复合规则（含各条件最近命中）。
 - `GET /sessions/{session_id}/correlated-rules/{rule_id}`：单条规则；不存在 → 404。
 
-### 13. 查询当前复合命中
+### 14. 查询当前复合命中
 
 `GET /sessions/{session_id}/correlated-alerts/current`
 
@@ -384,7 +446,7 @@ curl -s -X POST localhost:8000/sessions/lab-1/correlated-rules \
 curl -s 'localhost:8000/sessions/lab-1/correlated-alerts/current'
 ```
 
-### 14. 查询复合事件历史（分页）
+### 15. 查询复合事件历史（分页）
 
 `GET /sessions/{session_id}/correlated-alerts/history?limit=100&cursor=...&rule_id=...`
 
@@ -409,6 +471,10 @@ curl -s 'localhost:8000/sessions/lab-1/correlated-alerts/history?limit=20'
 - **v2**：有限采集会话封存——`sessions` 增加 `status`（`open`/`closed`）与 `closed_at`，
   `session_sources` 增加 `final_observed_at` 与 `sealed_at`（老库升级后既有会话为
   `open`、各来源未封存，行为不变）。
+- **v3**：已发布流消费者检查点——新增 `stream_checkpoints` 表
+  （主键 `(session_id, checkpoint_name)`，冻结位置三元组
+  `position_observed_at / position_source_id / position_seq`、同一快照下的
+  `published_watermark` 与 `created_at`）及按会话列检查点的索引；老库升级不影响既有数据。
 
 ## 端到端示例（来源封存与尾流发布）
 
@@ -458,6 +524,21 @@ curl -s 'localhost:8000/sessions/lab-1/correlated-alerts/history?limit=20'
 
 期间任何因迟到而被隔离的读数都不会参与复合或使命中过期。
 
+## 端到端示例（消费者检查点与续读）
+
+两个温度计，迟到容忍 0s（发布规则仍为严格小于水位线）。消费者先处理一批，再打检查点：
+
+| 时刻/动作 | 已发布流尾部 | 结果 |
+| --- | --- | --- |
+| 上报 a seq=1@:10、b seq=1@:12 | 空（WM=:10，落在边界不发布） | 全部 buffered |
+| 上报 a seq=2@:13、b seq=2@:14 | b seq=1@:12（WM=:13，发布 a@:10、b@:12） | `published_total=2` |
+| `POST .../checkpoints {"checkpoint_name":"cp1"}` | — | **201**，`position = (@:12, b, 1)`，`published_watermark=:13` |
+| 再次创建同名 `cp1`（无新发布） | b seq=1@:12 | **200** 幂等，返回与首次完全相同的检查点 |
+| 上报 a seq=3@:15、b seq=3@:16 | b seq=2@:14（又发布 a@:13、b@:14） | 流尾部前移 |
+| 再次创建同名 `cp1` | — | **409**（同名不同位置），原检查点不变 |
+| `GET .../checkpoints/cp1/stream` | — | 只返回检查点之后的 a seq=2@:13、b seq=2@:14（确定顺序、游标分页） |
+| 封存 a、b（尾流发布剩余读数）后再续读 | — | 检查点位置/冻结水位线**不变**；新发布的读数照常可续读，重复续读结果稳定 |
+
 ## 项目结构
 
 ```
@@ -465,6 +546,7 @@ curl -s 'localhost:8000/sessions/lab-1/correlated-alerts/history?limit=20'
 ├── app/
 │   ├── main.py          # FastAPI 路由、异常映射
 │   ├── service.py       # 水位线计算 / 发布 / 隔离 / 幂等等核心逻辑
+│   ├── checkpoints.py   # 已发布流消费者检查点：创建（快照）/列表/删除/按检查点续读
 │   ├── alerts.py        # 单来源告警状态机、规则创建（回放）、当前/历史查询
 │   ├── correlated.py    # 跨来源复合规则、窗口命中维护、回放、当前/历史查询
 │   ├── errors.py        # 400/404/409 业务异常
@@ -474,10 +556,11 @@ curl -s 'localhost:8000/sessions/lab-1/correlated-alerts/history?limit=20'
 │   ├── time_utils.py    # ISO 8601 解析与 UTC 规范化
 │   └── config.py        # 环境变量配置
 ├── tests/
-│   ├── test_api.py        # 时间线/隔离/幂等等端到端行为测试（22 个）
-│   ├── test_alerts.py     # 单来源告警状态机/滞回/连续次数/隔离/回放/分页测试（27 个）
-│   ├── test_correlated.py # 跨来源复合/窗口/过期/再触发/隔离/回放/迁移测试（35 个）
-│   └── test_sealing.py    # 来源封存/幂等冲突/尾流发布/关闭/封存-上报并发测试（25 个）
+│   ├── test_api.py         # 时间线/隔离/幂等等端到端行为测试（22 个）
+│   ├── test_alerts.py      # 单来源告警状态机/滞回/连续次数/隔离/回放/分页测试（27 个）
+│   ├── test_correlated.py  # 跨来源复合/窗口/过期/再触发/隔离/回放/迁移测试（35 个）
+│   ├── test_sealing.py     # 来源封存/幂等冲突/尾流发布/关闭/封存-上报并发测试（25 个）
+│   └── test_checkpoints.py # 检查点快照/幂等冲突/列表删除/续读分页/关闭/迁移测试（29 个）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
