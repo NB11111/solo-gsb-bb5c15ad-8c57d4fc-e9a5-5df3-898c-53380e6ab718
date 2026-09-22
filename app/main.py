@@ -5,20 +5,24 @@ import sqlite3
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
-from fastapi import Depends, FastAPI, Query, Request
+from fastapi import Depends, FastAPI, Query, Request, Response
 from fastapi.responses import JSONResponse
 
-from . import alerts, correlated, service
+from . import alerts, checkpoints, correlated, service
 from .config import settings
 from .database import get_db, init_db
 from .models import (
     AlertHistoryResponse,
     AlertRuleOut,
     AlertRulesResponse,
+    CheckpointOut,
+    CheckpointStreamResponse,
+    CheckpointsResponse,
     CorrelatedHistoryResponse,
     CorrelatedRuleOut,
     CorrelatedRulesResponse,
     CreateAlertRuleIn,
+    CreateCheckpointIn,
     CreateCorrelatedRuleIn,
     CreateSessionIn,
     CreatedSessionResponse,
@@ -43,7 +47,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Lab Sensor Timeline Merge API",
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "Out-of-order sensor reporting with per-session fixed source lists, "
         "a slowest-source watermark (minus allowed lateness), deterministic "
@@ -209,6 +213,98 @@ def pull_quarantine(
 ) -> QuarantineResponse:
     """Late readings that arrived behind the already-published watermark."""
     return QuarantineResponse(**service.list_quarantined(conn, session_id, limit, cursor))
+
+
+# ---------------------------------------------------------------------------
+# consumer checkpoints over the published stream
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/sessions/{session_id}/checkpoints",
+    response_model=CheckpointOut,
+    status_code=201,
+    tags=["checkpoints"],
+)
+def create_checkpoint(
+    session_id: str,
+    body: CreateCheckpointIn,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> Response:
+    """Capture a consumer checkpoint at the current published-stream position.
+
+    The position (number of published readings and the last reading's
+    deterministic-order keyset) and the session's published watermark are
+    recorded together in one serialised write transaction, i.e. one read
+    snapshot.  Checkpoint names are unique within a session: re-creating the
+    same name at the same position is idempotent (200, the original snapshot is
+    returned unchanged); creating it once the stream has moved to a different
+    position returns 409.  Later publishes and session closure never mutate a
+    checkpoint.
+    """
+    result, created = checkpoints.create_checkpoint(conn, session_id, body.name)
+    return JSONResponse(
+        status_code=201 if created else 200,
+        content=CheckpointOut(**result).model_dump(),
+    )
+
+
+@app.get(
+    "/sessions/{session_id}/checkpoints",
+    response_model=CheckpointsResponse,
+    tags=["checkpoints"],
+)
+def list_checkpoints(
+    session_id: str,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> CheckpointsResponse:
+    """List the session's checkpoints (oldest first)."""
+    return CheckpointsResponse(**checkpoints.list_checkpoints(conn, session_id))
+
+
+@app.delete(
+    "/sessions/{session_id}/checkpoints/{name}",
+    status_code=204,
+    tags=["checkpoints"],
+)
+def delete_checkpoint(
+    session_id: str,
+    name: str,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> Response:
+    """Delete one checkpoint.  Unknown session -> 404; unknown name -> 404."""
+    checkpoints.delete_checkpoint(conn, session_id, name)
+    return Response(status_code=204)
+
+
+@app.get(
+    "/sessions/{session_id}/checkpoints/{name}/stream",
+    response_model=CheckpointStreamResponse,
+    tags=["checkpoints"],
+)
+def continue_at_checkpoint(
+    session_id: str,
+    name: str,
+    limit: int = Query(100, ge=1, le=1000),
+    cursor: Optional[str] = Query(
+        None,
+        description=(
+            "Opaque next_cursor from a previous page; omit to start right after"
+            " the checkpoint position"
+        ),
+    ),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> CheckpointStreamResponse:
+    """Resume the published stream at a checkpoint, in the same deterministic
+    order and with the same opaque keyset pagination as ``/stream``.
+
+    With no ``cursor`` the first page returns readings strictly after the
+    checkpoint's captured position; subsequent pages pass ``next_cursor`` back
+    verbatim.  The checkpoint itself is immutable, so reads published (or a
+    session closed) afterwards do not shift the resume point.
+    """
+    return CheckpointStreamResponse(
+        **checkpoints.continue_from_checkpoint(conn, session_id, name, limit, cursor)
+    )
 
 
 # ---------------------------------------------------------------------------

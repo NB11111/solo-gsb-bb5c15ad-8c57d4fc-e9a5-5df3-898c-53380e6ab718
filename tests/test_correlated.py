@@ -663,7 +663,7 @@ class TestMigrations:
         try:
             versions = [r[0] for r in conn.execute(
                 "SELECT version FROM schema_migrations ORDER BY version")]
-            assert versions == [1, 2]
+            assert versions == [1, 2, 3]
             row = conn.execute(
                 "SELECT session_id FROM sessions WHERE session_id = 'legacy-s'"
             ).fetchone()

@@ -239,9 +239,46 @@ def _migration_2(conn: sqlite3.Connection, applied_at: str) -> None:
     )
 
 
+def _migration_3(conn: sqlite3.Connection, applied_at: str) -> None:
+    """Consumer checkpoints over a session's published reading stream.
+
+    A checkpoint snapshots, inside one serialised transaction, the current
+    position of the published stream (``stream_offset`` published readings plus
+    the keyset ``(last_observed_at, last_source_id, last_seq)`` of its last
+    reading -- all NULL/0 before the first publish) and the session's
+    ``published_watermark`` at that same instant.  Names are unique per
+    session.  Checkpoint rows are immutable: later publishes, source seals and
+    session closure never rewrite them, so resuming from a checkpoint always
+    means the same stream position.
+    """
+    conn.execute(
+        """
+CREATE TABLE checkpoints (
+    session_id           TEXT NOT NULL REFERENCES sessions(session_id),
+    name                 TEXT NOT NULL,
+    created_at           TEXT NOT NULL,
+    -- Stream position at creation: the number of readings published so far
+    -- and the deterministic-order keyset of the last one (NULL while offset=0).
+    stream_offset        INTEGER NOT NULL,
+    last_observed_at     TEXT,
+    last_source_id       TEXT,
+    last_seq             INTEGER,
+    -- Snapshot of sessions.published_watermark taken in the same transaction.
+    published_watermark  TEXT,
+    PRIMARY KEY (session_id, name)
+)
+"""
+    )
+    conn.execute(
+        "INSERT INTO schema_migrations (version, applied_at) VALUES (3, ?)",
+        (applied_at,),
+    )
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection, str], None]] = {
     1: _migration_1,
     2: _migration_2,
+    3: _migration_3,
 }
 LATEST_VERSION = max(MIGRATIONS)
 

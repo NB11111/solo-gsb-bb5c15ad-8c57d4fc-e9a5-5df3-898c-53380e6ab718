@@ -57,7 +57,7 @@ docker compose up --build
 ```bash
 python3 -m pip install -r requirements.txt
 SENSOR_DB_PATH=./sensors.db uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行 109 个端到端行为测试（需 pytest、httpx）
+pytest -q        # 运行 148 个端到端行为测试（需 pytest、httpx）
 ```
 
 ## 时间线语义
@@ -396,6 +396,67 @@ curl -s 'localhost:8000/sessions/lab-1/correlated-alerts/current'
 curl -s 'localhost:8000/sessions/lab-1/correlated-alerts/history?limit=20'
 ```
 
+### 15. 创建消费者检查点
+
+`POST /sessions/{session_id}/checkpoints`
+
+为会话已发布读数流的某个消费者记录一个**检查点**。请求体 `{"name": "..."}`：
+名称在会话内唯一，允许字母、数字、`.`、`_`、`-`（须以字母/数字开头，最长 128）。
+
+创建在**同一个 `BEGIN IMMEDIATE` 事务（同一只读快照）**内记录两件事：
+
+- 当前发布流**位置**：已发布读数条数 `stream_offset`，以及最后一条已发布读数的
+  确定顺序键 `(last_observed_at, last_source_id, last_seq)`（首条发布前三者为
+  `null`、偏移为 0）；
+- 该时刻会话的 `published_watermark`。
+
+```bash
+curl -s -X POST localhost:8000/sessions/lab-1/checkpoints \
+  -H 'Content-Type: application/json' -d '{"name": "consumer-1"}'
+```
+
+响应 201。**幂等与冲突**：
+
+- 同名检查点在**位置相同**时重复创建是幂等的，返回 200 与首次完全一致的结果
+  （`created_at`、记录的水位线均不变）；
+- 发布流已推进到**不同位置**后再创建同名检查点 → 409，且既有检查点绝不被改写。
+  注意幂等只取决于**位置**：水位线可能在没有新读数发布时前移（读数仍停在边界外），
+  此时重复创建仍返回首次快照。
+
+会话不存在 → 404；名称非法（空、含空格/斜杠等）或缺字段 → 422。
+检查点行一旦写入即为**不可变快照**：后续发布、来源封存乃至会话关闭都不会修改它。
+
+### 16. 列出 / 删除检查点
+
+- `GET /sessions/{session_id}/checkpoints`：列出会话全部检查点（按创建时间、名称排序），
+  每项含完整位置与水位线快照；会话不存在 → 404。
+- `DELETE /sessions/{session_id}/checkpoints/{name}`：删除一个检查点，成功 → 204；
+  检查点不存在 → 404，会话不存在 → 404。删除后该名称可重新创建。
+
+```bash
+curl -s localhost:8000/sessions/lab-1/checkpoints
+curl -s -X DELETE localhost:8000/sessions/lab-1/checkpoints/consumer-1
+```
+
+### 17. 从检查点继续读取
+
+`GET /sessions/{session_id}/checkpoints/{name}/stream?limit=100&cursor=...`
+
+- 沿用“拉取已发布流”的**确定顺序** `(observed_at, source_id, seq)` 与**不透明游标分页**
+  （`next_cursor` 原样回传，`null` 取完；`limit` 1～1000；损坏游标 → 400）。
+- 不带 `cursor` 时，首页从检查点捕获位置的**严格之后**开始（空流检查点等价于从头读）；
+  之后翻页把上一页的 `next_cursor` 原样回传。**游标不得指向检查点位置或其之前**（→ 400）。
+- 响应内嵌不可变的 `checkpoint` 快照；顶层 `published_watermark` 是会话**当前**水位线
+  （尾流发布后为终止水位线），与检查点记录的快照水位线各自独立。
+- 检查点含义不随后续发布或会话关闭改变：尾流发布、会话 `closed` 之后从同一检查点继续读，
+  恢复点仍然是创建时的位置，只会多读之后（含尾流）发布的读数；隔离读数永不出现。
+
+```bash
+curl -s 'localhost:8000/sessions/lab-1/checkpoints/consumer-1/stream?limit=50'
+```
+
+检查点不存在 → 404，会话不存在 → 404。
+
 ## 数据库迁移
 
 建表采用“**幂等基础 schema + 版本化迁移**”：应用启动（FastAPI lifespan）时自动创建
@@ -409,6 +470,10 @@ curl -s 'localhost:8000/sessions/lab-1/correlated-alerts/history?limit=20'
 - **v2**：有限采集会话封存——`sessions` 增加 `status`（`open`/`closed`）与 `closed_at`，
   `session_sources` 增加 `final_observed_at` 与 `sealed_at`（老库升级后既有会话为
   `open`、各来源未封存，行为不变）。
+- **v3**：发布流消费者检查点——新增 `checkpoints` 表（`(session_id, name)` 主键），
+  保存创建时同一快照内的发布流位置（`stream_offset` 与最后一条已发布读数的
+  `(last_observed_at, last_source_id, last_seq)` 键）和 `published_watermark`；
+  检查点行不可变，后续发布/封存/关闭均不改写它。
 
 ## 端到端示例（来源封存与尾流发布）
 
@@ -467,6 +532,7 @@ curl -s 'localhost:8000/sessions/lab-1/correlated-alerts/history?limit=20'
 │   ├── service.py       # 水位线计算 / 发布 / 隔离 / 幂等等核心逻辑
 │   ├── alerts.py        # 单来源告警状态机、规则创建（回放）、当前/历史查询
 │   ├── correlated.py    # 跨来源复合规则、窗口命中维护、回放、当前/历史查询
+│   ├── checkpoints.py   # 发布流消费者检查点：创建（同快照位置+水位线）/列表/删除/继续读取
 │   ├── errors.py        # 400/404/409 业务异常
 │   ├── cursor.py        # 不透明 keyset 分页游标
 │   ├── database.py      # SQLite schema、版本化迁移、连接、BEGIN IMMEDIATE 事务
@@ -474,10 +540,11 @@ curl -s 'localhost:8000/sessions/lab-1/correlated-alerts/history?limit=20'
 │   ├── time_utils.py    # ISO 8601 解析与 UTC 规范化
 │   └── config.py        # 环境变量配置
 ├── tests/
-│   ├── test_api.py        # 时间线/隔离/幂等等端到端行为测试（22 个）
-│   ├── test_alerts.py     # 单来源告警状态机/滞回/连续次数/隔离/回放/分页测试（27 个）
-│   ├── test_correlated.py # 跨来源复合/窗口/过期/再触发/隔离/回放/迁移测试（35 个）
-│   └── test_sealing.py    # 来源封存/幂等冲突/尾流发布/关闭/封存-上报并发测试（25 个）
+│   ├── test_api.py          # 时间线/隔离/幂等等端到端行为测试（22 个）
+│   ├── test_alerts.py       # 单来源告警状态机/滞回/连续次数/隔离/回放/分页测试（27 个）
+│   ├── test_correlated.py   # 跨来源复合/窗口/过期/再触发/隔离/回放/迁移测试（35 个）
+│   ├── test_sealing.py      # 来源封存/幂等冲突/尾流发布/关闭/封存-上报并发测试（25 个）
+│   └── test_checkpoints.py  # 检查点创建/幂等/409/继续读取分页/不可变/迁移测试（39 个）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

@@ -414,3 +414,67 @@ class CorrelatedHistoryResponse(BaseModel):
     session_id: str
     next_cursor: Optional[str] = None
     events: list[CorrelatedEventOut]
+
+
+# ---------------------------------------------------------------------------
+# consumer checkpoints on the published stream
+# ---------------------------------------------------------------------------
+
+# Checkpoint names identify a consumer position inside one session; restrict
+# them to URL/path-safe, shell-safe characters so they can be used unescaped.
+_CHECKPOINT_NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+
+
+class CreateCheckpointIn(BaseModel):
+    name: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        pattern=_CHECKPOINT_NAME_PATTERN,
+        description=(
+            "Consumer-chosen checkpoint name, unique within the session"
+            " (letters, digits, '.', '_', '-'; must start alphanumerically)"
+        ),
+    )
+
+
+class StreamPositionOut(BaseModel):
+    stream_offset: int = Field(
+        ..., description="Number of published readings captured at creation"
+    )
+    last_observed_at: Optional[str] = Field(
+        None, description="Event time of the last published reading at capture"
+    )
+    last_source_id: Optional[str] = Field(
+        None, description="Source of the last published reading at capture"
+    )
+    last_seq: Optional[int] = Field(
+        None, description="Sequence number of the last published reading at capture"
+    )
+
+
+class CheckpointOut(StreamPositionOut):
+    session_id: str
+    name: str
+    created_at: str
+    published_watermark: Optional[str] = Field(
+        None,
+        description="Session published watermark captured in the same snapshot",
+    )
+
+
+class CheckpointsResponse(BaseModel):
+    session_id: str
+    checkpoints: list[CheckpointOut]
+
+
+class CheckpointStreamResponse(BaseModel):
+    session_id: str
+    checkpoint: CheckpointOut = Field(
+        ..., description="The immutable checkpoint the read resumed from"
+    )
+    next_cursor: Optional[str] = None
+    published_watermark: Optional[str] = Field(
+        None, description="The session's current published watermark (may advance later)"
+    )
+    readings: list[ReadingOut]
